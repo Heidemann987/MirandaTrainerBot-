@@ -1,17 +1,12 @@
 {
   "name": "mirandatrainer",
   "version": "1.0.0",
-  "description": "Miranda Trainer — US interrogation trainer",
   "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
+  "scripts": { "start": "node bot.js" },
   "dependencies": {
     "express": "^4.19.2",
     "grammy": "^1.30.0",
     "openai": "^4.50.0"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": "20.x" }
 }
