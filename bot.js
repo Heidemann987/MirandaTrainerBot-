@@ -1,13 +1,13 @@
-// bot.js — Miranda Trainer (USA, English + Spanish)
-const { Bot, InlineKeyboard, InputFile } = require('grammy');
+// bot.js — Miranda Trainer (US, EN/ES) — 1 free trial + Stars paywall
+const { Bot, InlineKeyboard } = require('grammy');
 const OpenAI = require('openai');
 const express = require('express');
-const fs = require('fs');
 
 // ============ CONFIG ============
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || 'openrouter/free';
+const PRICE_XTR = 100; // 100 Stars
 
 if (!BOT_TOKEN) { console.error('TELEGRAM_BOT_TOKEN missing'); process.exit(1); }
 if (!OPENROUTER_KEY) { console.error('OPENROUTER_API_KEY missing'); process.exit(1); }
@@ -17,95 +17,90 @@ const ai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1'
 });
 
-// ============ STATUS LABELS ============
+// ============ USER STATE (in-memory) ============
+const users = new Map(); // userId -> { trialUsed, paid }
+
+function getUser(userId) {
+  return users.get(userId) || { trialUsed: false, paid: false };
+}
+function setUser(userId, patch) {
+  users.set(userId, { ...getUser(userId), ...patch });
+}
+
+// ============ STATUS ============
 const STATUS = {
-  witness:   { en: 'Witness', es: 'Testigo' },
-  suspect:   { en: 'Suspect', es: 'Sospechoso' },
-  defendant: { en: 'Defendant', es: 'Acusado' },
-  victim:    { en: 'Victim', es: 'Víctima' },
-  plaintiff: { en: 'Plaintiff', es: 'Demandante' },
-  respondent:{ en: 'Respondent', es: 'Demandado' }
+  witness:    { en: 'Witness', es: 'Testigo' },
+  suspect:    { en: 'Suspect', es: 'Sospechoso' },
+  defendant:  { en: 'Defendant', es: 'Acusado' },
+  victim:     { en: 'Victim', es: 'Víctima' },
+  plaintiff:  { en: 'Plaintiff', es: 'Demandante' },
+  respondent: { en: 'Respondent', es: 'Demandado' }
 };
 
-// ============ SYSTEM PROMPTS ============
+// ============ PROMPTS ============
 function buildPrompt(lang, status) {
   const statusEn = STATUS[status]?.en || 'Witness';
   const statusEs = STATUS[status]?.es || 'Testigo';
 
-  const laws = `- U.S. Constitution, 4th Amendment — protection against unreasonable searches and seizures
-- U.S. Constitution, 5th Amendment — right against self-incrimination, due process
-- U.S. Constitution, 6th Amendment — right to counsel, speedy and public trial
-- U.S. Constitution, 14th Amendment — due process, equal protection
-- Miranda v. Arizona, 384 U.S. 436 (1966) — required warnings before custodial interrogation
-- Gideon v. Wainwright, 372 U.S. 335 (1963) — right to appointed counsel
-- Escobedo v. Illinois, 378 U.S. 478 (1964) — right to counsel during interrogation
-- Berghuis v. Thompkins, 560 U.S. 370 (2010) — must invoke right to remain silent unambiguously
-- Federal Rules of Criminal Procedure (esp. Rules 5, 5.1, 6, 7)
-- Federal Rules of Evidence (esp. Rules 801, 802 — hearsay)
-- Brady v. Maryland, 373 U.S. 83 (1963) — prosecution must disclose exculpatory evidence`;
+  const laws = `- U.S. Constitution, 4th Amendment — unreasonable searches and seizures
+- U.S. Constitution, 5th Amendment — right against self-incrimination
+- U.S. Constitution, 6th Amendment — right to counsel
+- U.S. Constitution, 14th Amendment — due process
+- Miranda v. Arizona, 384 U.S. 436 (1966)
+- Gideon v. Wainwright, 372 U.S. 335 (1963)
+- Escobedo v. Illinois, 378 U.S. 478 (1964)
+- Berghuis v. Thompkins, 560 U.S. 370 (2010)
+- Brady v. Maryland, 373 U.S. 83 (1963)`;
 
   if (lang === 'ES') {
-    return `Eres un entrenador de interrogatorios para Estados Unidos. Estado procesal del usuario: ${statusEs}. Idioma: Español.
+    return `Eres un entrenador de interrogatorios para Estados Unidos. Estado procesal: ${statusEs}. Idioma: Español.
 
-IMPORTANTE PARA FORMATO:
-- Usa SOLO asteriscos simples para negrita: *Texto* — no **Texto**.
-- Para listas usa "•" y emojis.
-- No uses tablas markdown.
-
-ROL: Simulación realista de interrogatorio. Responde ESTRICTAMENTE en este formato:
+FORMATO: usa SOLO asteriscos simples para negrita: *Texto* — no **Texto**.
 
 🎭 Interrogador (Detective):
-(Pregunta o declaración realista del detective/investigador, adaptada al estado "${statusEs}". Solo en español.)
+(Pregunta realista, adaptada al estado "${statusEs}". Solo en español.)
 
 💡 Abogado-Entrenador:
-• 🎯 Análisis de la trampa: propósito de la pregunta y riesgo
-• ⚠️ Error peligroso: cómo NO responder
-• 🛡️ Estrategia correcta: 2-3 formulaciones seguras con referencias a normas
+• 🎯 Análisis de la trampa
+• ⚠️ Error peligroso
+• 🛡️ Estrategia correcta: 2-3 formulaciones con referencias
 
-📊 Evaluación de su respuesta anterior:
-(Si el usuario ya respondió — evalúa brevemente: ✅/⚠️/❌. En la primera ronda — escribe "Primera ronda — la evaluación viene después.")
+📊 Evaluación de su respuesta anterior: (✅/⚠️/❌ o "Primera ronda — la evaluación viene después.")
 
 BASE LEGAL:
 ${laws}
 
 REGLAS:
-1. Enseñar a responder solo a la pregunta formulada.
-2. Distinguir entre "no recuerdo" y el derecho a guardar silencio.
-3. El estado procesal es "${statusEs}" — tómalo en cuenta.
-4. No dar asesoría legal sobre el caso.
-5. Responder SOLO en español.`;
+1. Solo responder a la pregunta formulada.
+2. Distinguir "no recuerdo" del derecho a guardar silencio.
+3. Estado: "${statusEs}".
+4. Sin asesoría legal.
+5. SOLO en español.`;
   }
 
-  // Default — English
-  return `You are an interrogation trainer for the United States. User's procedural status: ${statusEn}. Language: English.
+  return `You are an interrogation trainer for the United States. Procedural status: ${statusEn}. Language: English.
 
-IMPORTANT FORMATTING:
-- Use ONLY single asterisks for bold: *Text* — not **Text**.
-- For lists use "•" and emojis.
-- Do not use markdown tables.
-
-ROLE: Realistic interrogation simulation. Respond STRICTLY in this format:
+FORMAT: use ONLY single asterisks for bold: *Text* — not **Text**.
 
 🎭 Investigator (Detective):
-(Realistic question or statement from the detective, adapted to status "${statusEn}". English only.)
+(Realistic question adapted to status "${statusEn}". English only.)
 
 💡 Trainer-Attorney:
-• 🎯 Trap analysis: purpose of the question and the risk
-• ⚠️ Dangerous mistake: how NOT to respond
-• 🛡️ Correct strategy: 2-3 safe formulations with references to law
+• 🎯 Trap analysis
+• ⚠️ Dangerous mistake
+• 🛡️ Correct strategy: 2-3 formulations with references
 
-📊 Evaluation of your previous answer:
-(If user already answered — briefly evaluate: ✅/⚠️/❌. First round — write "First round — evaluation comes next.")
+📊 Evaluation of your previous answer: (✅/⚠️/❌ or "First round — evaluation comes next.")
 
 LEGAL BASIS:
 ${laws}
 
 RULES:
-1. Teach to answer only the question asked.
-2. Distinguish between "I don't recall" and the right to remain silent.
-3. The procedural status is "${statusEn}" — take it into account.
-4. Do not give legal advice on the case.
-5. Respond ONLY in English.`;
+1. Answer only the question asked.
+2. Distinguish "I don't recall" from the right to remain silent.
+3. Status: "${statusEn}".
+4. No legal advice.
+5. ONLY in English.`;
 }
 
 // ============ SESSIONS ============
@@ -113,12 +108,29 @@ const sessions = new Map();
 
 // ============ BOT ============
 const bot = new Bot(BOT_TOKEN);
-
 bot.catch((err) => console.error('Bot error:', err));
 
-// /start
+// ============ PAYWALL ============
+function showPaywall(ctx) {
+  const kb = new InlineKeyboard().text(`⭐ Unlock lifetime access — ${PRICE_XTR} Stars`, 'buy_access');
+  return ctx.reply(
+    '🔒 *Free trial used*\n\n' +
+    'You have completed your one free interrogation training.\n\n' +
+    '*Unlimited access — one-time payment, lifetime use:*',
+    { parse_mode: 'Markdown', reply_markup: kb }
+  );
+}
+
+// ============ /start ============
 bot.command('start', async (ctx) => {
-  sessions.delete(ctx.from.id);
+  const userId = ctx.from.id;
+  const u = getUser(userId);
+
+  if (!u.paid && u.trialUsed) {
+    return showPaywall(ctx);
+  }
+
+  sessions.delete(userId);
 
   const kb = new InlineKeyboard()
     .text('🇺🇸 English', 'lang:EN').row()
@@ -126,14 +138,40 @@ bot.command('start', async (ctx) => {
 
   await ctx.reply(
     '⚖️ *Miranda Trainer*\n\n' +
-    'Interrogation training for the United States.\n' +
-    'Entrenamiento de interrogatorios para Estados Unidos.\n\n' +
+    (u.paid ? '' : '🎁 *Your first training is free.*\n\n') +
     'Choose your language / Elija su idioma:',
     { parse_mode: 'Markdown', reply_markup: kb }
   );
 });
 
-// Выбор языка → меню статусов
+// ============ BUY ============
+bot.callbackQuery('buy_access', async (ctx) => {
+  const userId = ctx.from.id;
+  await ctx.answerCallbackQuery();
+
+  await ctx.replyWithInvoice(
+    'Miranda Trainer — Lifetime Access',
+    'One-time payment. Unlimited interrogations, forever.',
+    `miranda_access_${userId}`,
+    'XTR',
+    [{ label: 'Lifetime Access', amount: PRICE_XTR }],
+    { provider_token: '' }
+  );
+});
+
+// ============ PAYMENT ============
+bot.on('message:successful_payment', async (ctx) => {
+  const userId = ctx.from.id;
+  setUser(userId, { paid: true });
+
+  await ctx.reply(
+    '✅ *Payment received!*\n\n' +
+    'Lifetime access activated. Send /start to begin.',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ============ LANGUAGE ============
 bot.callbackQuery(/^lang:(EN|ES)$/, async (ctx) => {
   const lang = ctx.match[1];
   sessions.set(ctx.from.id, { lang, status: null, incident: null, history: [] });
@@ -149,11 +187,7 @@ bot.callbackQuery(/^lang:(EN|ES)$/, async (ctx) => {
       .text('📋 Demandante', 'st:plaintiff').row()
       .text('📋 Demandado', 'st:respondent');
 
-    await ctx.reply('🇺🇸 *Español*\n\n*Seleccione su estado procesal:*', {
-      parse_mode: 'Markdown',
-      reply_markup: kb
-    });
-    return;
+    return ctx.reply('🇺🇸 *Español*\n\n*Seleccione su estado procesal:*', { parse_mode: 'Markdown', reply_markup: kb });
   }
 
   const kb = new InlineKeyboard()
@@ -164,161 +198,98 @@ bot.callbackQuery(/^lang:(EN|ES)$/, async (ctx) => {
     .text('📋 Plaintiff', 'st:plaintiff').row()
     .text('📋 Respondent', 'st:respondent');
 
-  await ctx.reply('🇺🇸 *English*\n\n*Select your procedural status:*', {
-    parse_mode: 'Markdown',
-    reply_markup: kb
-  });
+  await ctx.reply('🇺🇸 *English*\n\n*Select your procedural status:*', { parse_mode: 'Markdown', reply_markup: kb });
 });
 
-// Выбор статуса → инцидент
+// ============ STATUS ============
 bot.callbackQuery(/^st:(witness|suspect|defendant|victim|plaintiff|respondent)$/, async (ctx) => {
   const status = ctx.match[1];
   const sess = sessions.get(ctx.from.id);
-  if (!sess) return ctx.answerCallbackQuery({ text: 'Start with /start' });
+  if (!sess) return ctx.answerCallbackQuery({ text: 'Send /start' });
 
   sess.status = status;
   await ctx.answerCallbackQuery();
 
   if (sess.lang === 'ES') {
-    await ctx.reply(
-      `🇺🇸 *${STATUS[status].es}*\n\n` +
-      `*Describa su incidente en detalle.*\n\n` +
-      `No incluya nombres, direcciones, números de teléfono o SSN.`,
+    return ctx.reply(
+      `🇺🇸 *${STATUS[status].es}*\n\n*Describa su incidente en detalle.*\n\nNo incluya nombres, direcciones, teléfonos.`,
       { parse_mode: 'Markdown' }
     );
-    return;
   }
 
   await ctx.reply(
-    `🇺🇸 *${STATUS[status].en}*\n\n` +
-    `*Describe your incident in detail.*\n\n` +
-    `Do not include names, addresses, phone numbers or SSN.`,
+    `🇺🇸 *${STATUS[status].en}*\n\n*Describe your incident in detail.*\n\nDo not include names, addresses, phones.`,
     { parse_mode: 'Markdown' }
   );
 });
 
-// /reset
+// ============ /reset ============
 bot.command('reset', async (ctx) => {
   sessions.delete(ctx.from.id);
-  await ctx.reply('Session reset. / Sesión reiniciada.\n\nSend /start.');
+  await ctx.reply('Session reset. Send /start.');
 });
 
-// /help
+// ============ /help ============
 bot.command('help', async (ctx) => {
   await ctx.reply(
-    '⚖️ *Miranda Trainer — Help / Ayuda*\n\n' +
-    '• /start — begin / comenzar\n' +
-    '• /reset — reset session / reiniciar sesión\n' +
-    '• /finish — final evaluation / evaluación final\n' +
-    '• /export — save report / guardar informe\n' +
-    '• /help — this help / esta ayuda',
+    '⚖️ *Miranda Trainer — Help*\n\n' +
+    '• /start — begin\n' +
+    '• /reset — reset session\n' +
+    '• /finish — final evaluation\n' +
+    '• /help — this help',
     { parse_mode: 'Markdown' }
   );
 });
 
-// /finish
+// ============ /finish ============
 bot.command('finish', async (ctx) => {
   const sess = sessions.get(ctx.from.id);
-  if (!sess || !sess.incident) {
-    return ctx.reply(sess?.lang === 'ES' ? 'Comience con /start' : 'Start with /start');
-  }
+  if (!sess || !sess.incident) return ctx.reply('Start with /start');
 
-  const finishPrompt = sess.lang === 'ES'
-    ? 'Termina la sesión de entrenamiento. Da una evaluación final: fortalezas, debilidades, recomendaciones. Breve y concreto.'
-    : 'End the training session. Give a final evaluation: strengths, weaknesses, recommendations. Brief and specific.';
-
-  sess.history.push({ role: 'user', content: finishPrompt });
+  sess.history.push({
+    role: 'user',
+    content: sess.lang === 'ES'
+      ? 'Termina la sesión. Da evaluación final: fortalezas, debilidades, recomendaciones.'
+      : 'End the session. Give final evaluation: strengths, weaknesses, recommendations.'
+  });
 
   try {
     await ctx.replyWithChatAction('typing');
-    const response = await ai.chat.completions.create({
-      model: MODEL,
-      messages: sess.history,
-      temperature: 0.7,
-      max_tokens: 1500
+    const r = await ai.chat.completions.create({
+      model: MODEL, messages: sess.history, temperature: 0.7, max_tokens: 1500
     });
-    const answer = response.choices[0].message.content;
-    const title = sess.lang === 'ES' ? '🎓 *RESULTADO*\n\n' : '🎓 *FINAL REPORT*\n\n';
-    await sendLong(ctx, title + answer, 'Markdown');
+    const answer = r.choices[0].message.content;
+    await sendLong(ctx, (sess.lang === 'ES' ? '🎓 *RESULTADO*\n\n' : '🎓 *FINAL REPORT*\n\n') + answer, 'Markdown');
   } catch (e) {
     console.error(e);
     await ctx.reply('Error getting the summary.');
   }
 });
 
-// /export
-bot.command('export', async (ctx) => {
-  const userId = ctx.from.id;
-  const sess = sessions.get(userId);
-
-  if (!sess || !sess.incident) {
-    return ctx.reply(sess?.lang === 'ES' ? 'No hay sesión activa. Comience con /start' : 'No active session. Start with /start');
-  }
-
-  await ctx.reply(sess.lang === 'ES' ? '📄 Preparando archivo...' : '📄 Preparing file...');
-
-  try {
-    let content = '';
-    content += '===========================================\n';
-    content += '       MIRANDA TRAINER — TRAINING REPORT\n';
-    content += '===========================================\n\n';
-    content += 'Date / Fecha: ' + new Date().toISOString().slice(0, 19).replace('T', ' ') + '\n';
-    content += 'Language / Idioma: ' + sess.lang + '\n';
-    content += 'Status / Estado: ' + (STATUS[sess.status]?.en || '—') + ' / ' + (STATUS[sess.status]?.es || '—') + '\n\n';
-
-    content += '-------------------------------------------\n';
-    content += 'INCIDENT / INCIDENTE:\n';
-    content += '-------------------------------------------\n';
-    content += (sess.incident || '—') + '\n\n';
-
-    content += '-------------------------------------------\n';
-    content += 'DIALOG / DIÁLOGO:\n';
-    content += '-------------------------------------------\n\n';
-
-    sess.history.forEach((msg) => {
-      if (msg.role === 'system') return;
-      const label = msg.role === 'user' ? '► USER / USUARIO' : '◆ TRAINER / ENTRENADOR';
-      content += label + ':\n' + (msg.content || '') + '\n\n';
-    });
-
-    content += '===========================================\n';
-    content += 'This is training material, not legal advice.\n';
-    content += 'Este es material de entrenamiento, no asesoría legal.\n';
-    content += '===========================================\n';
-
-    const tmpPath = '/tmp/Miranda_Training_' + userId + '_' + Date.now() + '.txt';
-    fs.writeFileSync(tmpPath, content, 'utf8');
-
-    await ctx.replyWithDocument(new InputFile(tmpPath), {
-      caption: sess.lang === 'ES' ? '📄 Su entrenamiento ha sido guardado.' : '📄 Your training has been saved.'
-    });
-
-    fs.unlink(tmpPath, () => {});
-  } catch (e) {
-    console.error('Export error:', e);
-    await ctx.reply('Error creating file.');
-  }
-});
-
-// Основной обработчик
+// ============ MAIN HANDLER ============
 bot.on('message:text', async (ctx) => {
   const text = ctx.message.text;
   if (text.startsWith('/')) return;
 
-  const sess = sessions.get(ctx.from.id);
-  if (!sess) return ctx.reply('Start with /start');
+  const userId = ctx.from.id;
+  const u = getUser(userId);
+  const sess = sessions.get(userId);
+
+  if (!sess) return ctx.reply('Send /start');
   if (!sess.lang) return ctx.reply('Choose language: /start');
   if (!sess.status) return ctx.reply('Select procedural status.');
 
+  // First incident → mark trial as used
   if (!sess.incident) {
     sess.incident = text;
+    setUser(userId, { trialUsed: true });
     sess.history = [
       { role: 'system', content: buildPrompt(sess.lang, sess.status) },
       {
         role: 'user',
         content: sess.lang === 'ES'
-          ? `Incidente: ${text}\n\nComienza el entrenamiento. Primera pregunta del detective + comentario del Abogado-Entrenador.`
-          : `Incident: ${text}\n\nBegin training. First question from detective + Trainer-Attorney commentary.`
+          ? `Incidente: ${text}\n\nComienza. Primera pregunta + análisis del Abogado-Entrenador.`
+          : `Incident: ${text}\n\nBegin. First question + Trainer-Attorney commentary.`
       }
     ];
   } else {
@@ -328,27 +299,23 @@ bot.on('message:text', async (ctx) => {
     if (rest.length > 24) sess.history = [sys, ...rest.slice(-24)];
   }
 
-  const loading = sess.lang === 'ES' ? '⏳ Preparando respuesta...' : '⏳ Preparing response...';
-  await ctx.reply(loading);
+  await ctx.reply(sess.lang === 'ES' ? '⏳ Preparando respuesta...' : '⏳ Preparing response...');
 
   try {
     await ctx.replyWithChatAction('typing');
-    const response = await ai.chat.completions.create({
-      model: MODEL,
-      messages: sess.history,
-      temperature: 0.7,
-      max_tokens: 2000
+    const r = await ai.chat.completions.create({
+      model: MODEL, messages: sess.history, temperature: 0.7, max_tokens: 2000
     });
-    const answer = response.choices[0].message.content;
+    const answer = r.choices[0].message.content;
     sess.history.push({ role: 'assistant', content: answer });
     await sendLong(ctx, answer, 'Markdown');
   } catch (e) {
     console.error('AI error:', e);
-    await ctx.reply(sess.lang === 'ES' ? 'Error de IA.' : 'AI error.');
+    await ctx.reply('AI error.');
   }
 });
 
-// ============ ОТПРАВКА ДЛИННЫХ СООБЩЕНИЙ ============
+// ============ SEND LONG ============
 function cleanForTelegram(text) {
   let cleaned = text.replace(/\*\*([^*]+?)\*\*/g, '*$1*');
   cleaned = cleaned.replace(/__([^_]+?)__/g, '_$1_');
@@ -362,7 +329,6 @@ async function sendLong(ctx, text, parseMode) {
 
   const parts = [];
   let remaining = cleaned;
-
   while (remaining.length > MAX) {
     let end = remaining.lastIndexOf('\n\n', MAX);
     if (end < MAX / 2) end = remaining.lastIndexOf('\n', MAX);
@@ -373,12 +339,8 @@ async function sendLong(ctx, text, parseMode) {
   if (remaining) parts.push(remaining);
 
   for (const part of parts) {
-    try {
-      await ctx.reply(part, opts);
-    } catch (e) {
-      console.warn('Markdown parse error, sending plain:', e.message);
-      await ctx.reply(part);
-    }
+    try { await ctx.reply(part, opts); }
+    catch (e) { console.warn('Markdown err, plain:', e.message); await ctx.reply(part); }
   }
 }
 
